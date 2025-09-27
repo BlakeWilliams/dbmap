@@ -23,6 +23,13 @@ import (
 	"unicode"
 )
 
+const (
+	// placeholderMySQL uses ? placeholders (default for MySQL, SQLite)
+	placeholderMySQL placeholderStyle = iota
+	// placeholderPostgreSQL uses $1, $2, $3... placeholders (PostgreSQL)
+	placeholderPostgreSQL
+)
+
 var (
 	// ErrNoUpdates is returned when no updates are provided to an update operation
 	ErrNoUpdates = errors.New("no updates provided")
@@ -35,11 +42,15 @@ type (
 	// Updates is a map of struct fields to their values for Update* methods
 	Updates = map[string]any
 
+	// placeholderStyle represents the type of SQL placeholders to use (internal)
+	placeholderStyle int
+
 	// DB is a wrapper around sql.DB that provides lightweight ORM-like functionality.
 	DB struct {
-		db             queryable
-		modelTypeCache *sync.Map
-		time           clock
+		db               queryable
+		modelTypeCache   *sync.Map
+		time             clock
+		placeholderStyle placeholderStyle
 		// Pluralizer is used to pluralize table names. You can provide your own
 		// pluralizer by overriding this field.
 		Pluralizer Pluralizer
@@ -73,11 +84,30 @@ type (
 // New initializes a new DB instance with the provided sql.DB connection.
 func New(db *sql.DB) *DB {
 	return &DB{
-		db:             db,
-		Pluralizer:     defaultPluralizer,
-		modelTypeCache: &sync.Map{},
-		time:           realClock{},
+		db:               db,
+		Pluralizer:       defaultPluralizer,
+		modelTypeCache:   &sync.Map{},
+		time:             realClock{},
+		placeholderStyle: detectPlaceholderStyle(db),
 	}
+}
+
+// detectPlaceholderStyle inspects the database driver to determine the appropriate placeholder style
+func detectPlaceholderStyle(db *sql.DB) placeholderStyle {
+	driver := db.Driver()
+	driverType := reflect.TypeOf(driver)
+
+	if driverType != nil {
+		typeName := driverType.String()
+		pkgPath := driverType.PkgPath()
+
+		if strings.Contains(typeName, "postgres") || strings.Contains(typeName, "pq") ||
+			strings.Contains(pkgPath, "postgres") || strings.Contains(pkgPath, "pq") || strings.Contains(pkgPath, "pgx") {
+			return placeholderPostgreSQL
+		}
+	}
+
+	return placeholderMySQL
 }
 
 // newModelType creates a new modelType for the given destination
@@ -105,6 +135,26 @@ func (d *DB) Close() error {
 		return db.Close()
 	}
 	return nil
+}
+
+// generatePlaceholder creates the appropriate placeholder based on the database type
+func (d *DB) generatePlaceholder(position int) string {
+	switch d.placeholderStyle {
+	case placeholderPostgreSQL:
+		return fmt.Sprintf("$%d", position)
+	default: // placeholderMySQL
+		return "?"
+	}
+}
+
+// quoteIdentifier quotes database identifiers (table names, column names) based on the database type
+func (d *DB) quoteIdentifier(identifier string) string {
+	switch d.placeholderStyle {
+	case placeholderPostgreSQL:
+		return `"` + identifier + `"`
+	default: // placeholderMySQL
+		return "`" + identifier + "`"
+	}
 }
 
 // Select executes a query and scans the result into the provided model struct or slice of structs.
@@ -189,6 +239,7 @@ func (d *DB) InsertRecord(ctx context.Context, model any) error {
 	touchTimestamp(value, modelType.createdAtFieldIndex, now)
 	touchTimestamp(value, modelType.updatedAtFieldIndex, now)
 
+	placeholderPosition := 0
 	for _, col := range modelType.columns {
 		fieldValue := value.FieldByName(col.Name)
 
@@ -201,26 +252,50 @@ func (d *DB) InsertRecord(ctx context.Context, model any) error {
 			insertColumns.WriteString(", ")
 			insertValuePlaceholders.WriteString(", ")
 		}
-		insertColumns.WriteString("`" + columnName + "`")
+		insertColumns.WriteString(d.quoteIdentifier(columnName))
 		insertColumnData = append(insertColumnData, fieldValue.Interface())
-		insertValuePlaceholders.WriteString("?")
+		placeholderPosition++
+		insertValuePlaceholders.WriteString(d.generatePlaceholder(placeholderPosition))
 	}
 
-	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", modelType.tableName, insertColumns.String(), insertValuePlaceholders.String())
+	// Find ID field before executing insert
+	idField, hasIDField := d.findIDField(concreteValue(model), modelType)
+	
+	var insertSQL string
+	var id int64
+	
+	if d.placeholderStyle == placeholderPostgreSQL && hasIDField {
+		idColumnName := "id"
+		
+		insertSQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
+			d.quoteIdentifier(modelType.tableName),
+			insertColumns.String(),
+			insertValuePlaceholders.String(),
+			d.quoteIdentifier(idColumnName))
+		
+		row := d.db.QueryRowContext(ctx, insertSQL, insertColumnData...)
+		err = row.Scan(&id)
+		if err != nil {
+			return fmt.Errorf("failed to execute insert with RETURNING: %w", err)
+		}
+	} else {
+		insertSQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", d.quoteIdentifier(modelType.tableName), insertColumns.String(), insertValuePlaceholders.String())
+		
+		res, err := d.db.ExecContext(ctx, insertSQL, insertColumnData...)
+		if err != nil {
+			return fmt.Errorf("failed to execute insert: %w", err)
+		}
 
-	res, err := d.db.ExecContext(ctx, insertSQL, insertColumnData...)
-	if err != nil {
-		return fmt.Errorf("failed to execute insert: %w", err)
+		if hasIDField {
+			id, err = res.LastInsertId()
+			if err != nil {
+				return fmt.Errorf("failed to retrieve last insert ID: %w", err)
+			}
+		}
 	}
 
-	id, err := res.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("failed to retrieve last insert ID: %w", err)
-	}
-
-	// Attempt to set the ID field if it exists
-	idField, ok := d.findIDField(concreteValue(model), modelType)
-	if ok && idField.IsValid() && idField.CanSet() {
+	// Set the ID field if it exists and we got an ID
+	if hasIDField && idField.IsValid() && idField.CanSet() {
 		switch idField.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			idField.SetInt(id)
@@ -251,7 +326,7 @@ func (d *DB) Delete(ctx context.Context, modelRef any, queryFragment string, arg
 		return 0, fmt.Errorf("failed to prepare delete query: %w", err)
 	}
 
-	deleteSQL := fmt.Sprintf("DELETE FROM %s %s", modelType.tableName, fragment)
+	deleteSQL := fmt.Sprintf("DELETE FROM %s %s", d.quoteIdentifier(modelType.tableName), fragment)
 	res, err := d.db.ExecContext(ctx, deleteSQL, queryArgs...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to execute delete: %w", err)
@@ -333,7 +408,7 @@ func (d *DB) DeleteRecord(ctx context.Context, model any) (int64, error) {
 		return 0, fmt.Errorf("destination must be a pointer to a struct, got %s", modelType.baseType.Kind())
 	}
 
-	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE id = ?", modelType.tableName)
+	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE id = %s", d.quoteIdentifier(modelType.tableName), d.generatePlaceholder(1))
 	idField, ok := d.findIDField(concreteValue(model), modelType)
 	if !ok {
 		return 0, fmt.Errorf("struct does not have an ID field")
@@ -397,6 +472,7 @@ func (d *DB) Update(ctx context.Context, structType any, queryFragment string, a
 
 	var setClauses strings.Builder
 	updateValues := make([]any, 0, len(updates))
+	placeholderPosition := 0
 
 	for _, col := range modelType.columns {
 		if _, ok := updates[col.Name]; !ok {
@@ -411,7 +487,8 @@ func (d *DB) Update(ctx context.Context, structType any, queryFragment string, a
 		if setClauses.Len() > 0 {
 			setClauses.WriteString(", ")
 		}
-		setClauses.WriteString(fmt.Sprintf("`%s` = ?", name))
+		placeholderPosition++
+		setClauses.WriteString(fmt.Sprintf("%s = %s", d.quoteIdentifier(name), d.generatePlaceholder(placeholderPosition)))
 		updateValues = append(updateValues, updates[col.Name])
 	}
 
@@ -420,7 +497,7 @@ func (d *DB) Update(ctx context.Context, structType any, queryFragment string, a
 		return 0, fmt.Errorf("failed to prepare update query: %w", err)
 	}
 
-	updateSQL := fmt.Sprintf("UPDATE %s SET %s %s", modelType.tableName, setClauses.String(), fragment)
+	updateSQL := fmt.Sprintf("UPDATE %s SET %s %s", d.quoteIdentifier(modelType.tableName), setClauses.String(), fragment)
 	finalArgs := append(updateValues, whereArgs...)
 
 	res, err := d.db.ExecContext(ctx, updateSQL, finalArgs...)
@@ -495,6 +572,7 @@ func (d *DB) UpdateRecord(ctx context.Context, model any, updates Updates) error
 
 	var setClauses strings.Builder
 	updateValues := make([]any, 0, len(updates))
+	placeholderPosition := 0
 
 	for fieldName, val := range updates {
 		field, ok := modelType.elemType.FieldByName(fieldName)
@@ -508,11 +586,13 @@ func (d *DB) UpdateRecord(ctx context.Context, model any, updates Updates) error
 		if setClauses.Len() > 0 {
 			setClauses.WriteString(", ")
 		}
-		setClauses.WriteString(fmt.Sprintf("`%s` = ?", col))
+		placeholderPosition++
+		setClauses.WriteString(fmt.Sprintf("%s = %s", d.quoteIdentifier(col), d.generatePlaceholder(placeholderPosition)))
 		updateValues = append(updateValues, val)
 	}
 
-	updateSQL := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", modelType.tableName, setClauses.String())
+	placeholderPosition++
+	updateSQL := fmt.Sprintf("UPDATE %s SET %s WHERE id = %s", d.quoteIdentifier(modelType.tableName), setClauses.String(), d.generatePlaceholder(placeholderPosition))
 	updateValues = append(updateValues, idField.Interface())
 	_, err = d.db.ExecContext(ctx, updateSQL, updateValues...)
 	if err != nil {
@@ -554,10 +634,11 @@ func (d *DB) Transaction(ctx context.Context, fn func(tx *DB) error) error {
 	}()
 
 	txDB := &DB{
-		db:             tx,
-		modelTypeCache: d.modelTypeCache,
-		Pluralizer:     d.Pluralizer,
-		time:           d.time,
+		db:               tx,
+		modelTypeCache:   d.modelTypeCache,
+		Pluralizer:       d.Pluralizer,
+		time:             d.time,
+		placeholderStyle: d.placeholderStyle,
 	}
 
 	err = fn(txDB)
@@ -576,7 +657,7 @@ func (d *DB) Exists(ctx context.Context, structType any, queryFragment string, a
 
 	rows, err := d.Query(
 		ctx,
-		fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s "+queryFragment+")", modelType.tableName),
+		fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s "+queryFragment+")", d.quoteIdentifier(modelType.tableName)),
 		args,
 	)
 
@@ -608,7 +689,7 @@ func (d *DB) Count(ctx context.Context, structType any, queryFragment string, ar
 
 	rows, err := d.Query(
 		ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM %s "+queryFragment, modelType.tableName),
+		fmt.Sprintf("SELECT COUNT(*) FROM %s "+queryFragment, d.quoteIdentifier(modelType.tableName)),
 		args,
 	)
 
@@ -656,6 +737,7 @@ func scanStruct(fields []string, rows *sql.Rows, dest reflect.Value) error {
 func (d *DB) replaceNames(rawSql string, args Args) (string, []any, error) {
 	finalArgs := make([]any, 0, len(args))
 	builder := strings.Builder{}
+	placeholderCount := 0
 
 	sql := []rune(rawSql)
 	for i := 0; i < len(sql); i++ {
@@ -690,7 +772,14 @@ func (d *DB) replaceNames(rawSql string, args Args) (string, []any, error) {
 					return "", nil, fmt.Errorf("missing argument for named parameter: %s", name.String())
 				}
 				finalArgs = append(finalArgs, args[name.String()])
-				builder.WriteRune('?')
+
+				switch d.placeholderStyle {
+				case placeholderPostgreSQL:
+					placeholderCount++
+					builder.WriteString(fmt.Sprintf("$%d", placeholderCount))
+				default: // placeholderMySQL
+					builder.WriteRune('?')
+				}
 			} else {
 				builder.WriteRune('$')
 			}
@@ -717,11 +806,11 @@ func (d *DB) generateSelect(model *modelType) (string, []string) {
 		if len(columns) > 1 {
 			columnStr.WriteString(", ")
 		}
-		columnStr.WriteString("`" + model.tableName + "`.")
-		columnStr.WriteString("`" + columnName + "`")
+		columnStr.WriteString(d.quoteIdentifier(model.tableName) + ".")
+		columnStr.WriteString(d.quoteIdentifier(columnName))
 	}
 
-	return fmt.Sprintf("SELECT %s FROM %s", columnStr.String(), model.tableName), columns
+	return fmt.Sprintf("SELECT %s FROM %s", columnStr.String(), d.quoteIdentifier(model.tableName)), columns
 }
 
 func snake_case(name string) string {

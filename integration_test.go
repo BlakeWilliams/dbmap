@@ -241,10 +241,11 @@ func TestInsert(t *testing.T) {
 		mockClock := newMockClock(insertTime)
 
 		db := &DB{
-			db:             db.db,
-			modelTypeCache: db.modelTypeCache,
-			Pluralizer:     db.Pluralizer,
-			time:           mockClock,
+			db:               db.db,
+			modelTypeCache:   db.modelTypeCache,
+			Pluralizer:       db.Pluralizer,
+			time:             mockClock,
+			placeholderStyle: db.placeholderStyle,
 		}
 
 		kv := &KeyValue{
@@ -950,10 +951,11 @@ func TestUpdate(t *testing.T) {
 		mockClock := newMockClock(updateTime)
 
 		db := &DB{
-			db:             db.db,
-			modelTypeCache: db.modelTypeCache,
-			Pluralizer:     db.Pluralizer,
-			time:           mockClock,
+			db:               db.db,
+			modelTypeCache:   db.modelTypeCache,
+			Pluralizer:       db.Pluralizer,
+			time:             mockClock,
+			placeholderStyle: db.placeholderStyle,
 		}
 
 		rows, err := db.Update(ctx, &KeyValue{}, "WHERE `key` = $key", Args{"key": "test.update.updatedat"}, Updates{"Value": "updated"})
@@ -1129,10 +1131,11 @@ func TestUpdateRecord(t *testing.T) {
 		mockClock := newMockClock(initialTime)
 
 		db := &DB{
-			db:             db.db,
-			modelTypeCache: db.modelTypeCache,
-			Pluralizer:     db.Pluralizer,
-			time:           mockClock,
+			db:               db.db,
+			modelTypeCache:   db.modelTypeCache,
+			Pluralizer:       db.Pluralizer,
+			time:             mockClock,
+			placeholderStyle: db.placeholderStyle,
 		}
 
 		kv := &KeyValue{
@@ -1182,10 +1185,11 @@ func TestSqlNullTime(t *testing.T) {
 		mockClock := newMockClock(insertTime)
 
 		db := &DB{
-			db:             db.db,
-			modelTypeCache: db.modelTypeCache,
-			Pluralizer:     db.Pluralizer,
-			time:           mockClock,
+			db:               db.db,
+			modelTypeCache:   db.modelTypeCache,
+			Pluralizer:       db.Pluralizer,
+			time:             mockClock,
+			placeholderStyle: db.placeholderStyle,
 		}
 
 		nullTimeKV := &NullTimeKeyValue{
@@ -1222,10 +1226,11 @@ func TestSqlNullTime(t *testing.T) {
 		mockClock := newMockClock(insertTime)
 
 		db := &DB{
-			db:             db.db,
-			modelTypeCache: db.modelTypeCache,
-			Pluralizer:     db.Pluralizer,
-			time:           mockClock,
+			db:               db.db,
+			modelTypeCache:   db.modelTypeCache,
+			Pluralizer:       db.Pluralizer,
+			time:             mockClock,
+			placeholderStyle: db.placeholderStyle,
 		}
 
 		nullTimeKV := &NullTimeKeyValue{

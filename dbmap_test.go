@@ -7,7 +7,7 @@ import (
 )
 
 func TestDB_replaceNames(t *testing.T) {
-	db := &DB{}
+	db := &DB{placeholderStyle: placeholderMySQL}
 
 	tests := []struct {
 		name         string
@@ -234,16 +234,111 @@ func TestDB_generateSelect(t *testing.T) {
 		Age   int    // no db tag, should use snake_case
 	}
 
-	db := &DB{}
+	db := &DB{placeholderStyle: placeholderMySQL}
 
 	model, err := newModelType(TestStruct{}, defaultPluralizer)
 	require.NoError(t, err)
 
 	actualSQL, actualFields := db.generateSelect(model)
 
-	expectedSQL := "SELECT `test_structs`.`id`, `test_structs`.`name`, `test_structs`.`email_address`, `test_structs`.`age` FROM test_structs"
+	expectedSQL := "SELECT `test_structs`.`id`, `test_structs`.`name`, `test_structs`.`email_address`, `test_structs`.`age` FROM `test_structs`"
 	expectedFields := []string{"ID", "Name", "Email", "Age"}
 
 	require.Equal(t, expectedSQL, actualSQL)
 	require.Equal(t, expectedFields, actualFields)
+}
+
+func TestDB_generateSelect_PostgreSQL(t *testing.T) {
+	type TestStruct struct {
+		ID    int    `db:"id"`
+		Name  string `db:"name"`
+		Email string `db:"email_address"`
+		Age   int    // no db tag, should use snake_case
+	}
+
+	db := &DB{placeholderStyle: placeholderPostgreSQL}
+
+	model, err := newModelType(TestStruct{}, defaultPluralizer)
+	require.NoError(t, err)
+
+	actualSQL, actualFields := db.generateSelect(model)
+
+	expectedSQL := `SELECT "test_structs"."id", "test_structs"."name", "test_structs"."email_address", "test_structs"."age" FROM "test_structs"`
+	expectedFields := []string{"ID", "Name", "Email", "Age"}
+
+	require.Equal(t, expectedSQL, actualSQL)
+	require.Equal(t, expectedFields, actualFields)
+}
+
+func TestDB_replaceNames_PostgreSQL(t *testing.T) {
+	db := &DB{placeholderStyle: placeholderPostgreSQL}
+
+	tests := []struct {
+		name         string
+		rawSql       string
+		args         map[string]any
+		expectedSql  string
+		expectedArgs []any
+		shouldError  bool
+		errorMsg     string
+	}{
+		{
+			name:         "simple named parameter with PostgreSQL placeholders",
+			rawSql:       "SELECT * FROM users WHERE id = $id",
+			args:         map[string]any{"id": 123},
+			expectedSql:  "SELECT * FROM users WHERE id = $1",
+			expectedArgs: []any{123},
+		},
+		{
+			name:         "multiple named parameters with PostgreSQL placeholders",
+			rawSql:       "SELECT * FROM users WHERE id = $id AND name = $name",
+			args:         map[string]any{"id": 123, "name": "John"},
+			expectedSql:  "SELECT * FROM users WHERE id = $1 AND name = $2",
+			expectedArgs: []any{123, "John"},
+		},
+		{
+			name:         "same parameter used multiple times with PostgreSQL placeholders",
+			rawSql:       "SELECT * FROM logs WHERE user_id = $user_id OR admin_id = $user_id",
+			args:         map[string]any{"user_id": 456},
+			expectedSql:  "SELECT * FROM logs WHERE user_id = $1 OR admin_id = $2",
+			expectedArgs: []any{456, 456},
+		},
+		{
+			name:         "escaped $ symbol with PostgreSQL placeholders",
+			rawSql:       "SELECT * FROM users WHERE price LIKE '$$19.99'",
+			args:         map[string]any{},
+			expectedSql:  "SELECT * FROM users WHERE price LIKE '$19.99'",
+			expectedArgs: []any{},
+		},
+		{
+			name:         "complex query with PostgreSQL placeholders",
+			rawSql:       "SELECT * FROM orders WHERE user_id = $user_id AND status = $status AND total > $min_total",
+			args:         map[string]any{"user_id": 123, "status": "completed", "min_total": 100.0},
+			expectedSql:  "SELECT * FROM orders WHERE user_id = $1 AND status = $2 AND total > $3",
+			expectedArgs: []any{123, "completed", 100.0},
+		},
+		{
+			name:        "missing parameter should return error with PostgreSQL placeholders",
+			rawSql:      "SELECT * FROM users WHERE id = $missing",
+			args:        map[string]any{"other": 123},
+			shouldError: true,
+			errorMsg:    "missing argument for named parameter: missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actualSql, actualArgs, err := db.replaceNames(tt.rawSql, tt.args)
+
+			if tt.shouldError {
+				require.Error(t, err)
+				require.Equal(t, tt.errorMsg, err.Error())
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedSql, actualSql)
+			require.Equal(t, tt.expectedArgs, actualArgs)
+		})
+	}
 }
