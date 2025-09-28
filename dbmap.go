@@ -248,6 +248,10 @@ func (d *DB) InsertRecord(ctx context.Context, model any) error {
 			columnName = snake_case(col.Name)
 		}
 
+		if columnName == "id" && fieldValue.IsZero() {
+			continue
+		}
+
 		if insertColumns.Len() > 0 {
 			insertColumns.WriteString(", ")
 			insertValuePlaceholders.WriteString(", ")
@@ -260,19 +264,19 @@ func (d *DB) InsertRecord(ctx context.Context, model any) error {
 
 	// Find ID field before executing insert
 	idField, hasIDField := d.findIDField(concreteValue(model), modelType)
-	
+
 	var insertSQL string
 	var id int64
-	
+
 	if d.placeholderStyle == placeholderPostgreSQL && hasIDField {
 		idColumnName := "id"
-		
+
 		insertSQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
 			d.quoteIdentifier(modelType.tableName),
 			insertColumns.String(),
 			insertValuePlaceholders.String(),
 			d.quoteIdentifier(idColumnName))
-		
+
 		row := d.db.QueryRowContext(ctx, insertSQL, insertColumnData...)
 		err = row.Scan(&id)
 		if err != nil {
@@ -280,7 +284,7 @@ func (d *DB) InsertRecord(ctx context.Context, model any) error {
 		}
 	} else {
 		insertSQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", d.quoteIdentifier(modelType.tableName), insertColumns.String(), insertValuePlaceholders.String())
-		
+
 		res, err := d.db.ExecContext(ctx, insertSQL, insertColumnData...)
 		if err != nil {
 			return fmt.Errorf("failed to execute insert: %w", err)
